@@ -5,6 +5,7 @@ Massive booster and the Gigazilla catch tower. The rework of KAESA StarCraft 1.0
 crafts and saves keep working).
 
 ![Globelink deploy](images/imagem%20sigma%20deploy%20globelink.png)
+(photo from KAESA STARCRAFT old mod by Bob Kerman)
 
 ## Features
 
