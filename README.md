@@ -4,7 +4,7 @@ A fully reusable super heavy launch system for Kerbal Space Program 1.12.x, by K
 Massive booster and the Gigazilla catch tower. The rework of KAESA StarCraft 1.0 (internal names unchanged, so old
 crafts and saves keep working).
 
-![StarCraft Flight 4](images/starcraft_flight4.png)
+![StarCraft Flight 4](images/imagem sigma deploy globelink.png)
 
 ## Features
 
