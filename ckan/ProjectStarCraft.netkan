@@ -1,0 +1,40 @@
+# Project StarCraft - CKAN metadata (NetKAN, YAML)
+# ONE source only: the SpaceDock page. The GitHub release must carry the same single zip and the same version
+# (two zips / mismatched versions made CKAN see "2 modules" for KAESA StarCraft).
+# >>> Replace NEW_ID with the number of the new SpaceDock page before sending this to CKAN. <<<
+identifier: ProjectStarCraft
+$kref: '#/ckan/spacedock/NEW_ID'
+$vref: '#/ckan/ksp-avc'
+license:
+  - CC-BY-NC-SA-4.0
+  - MIT
+tags:
+  - parts
+  - plugin
+  - crewed
+conflicts:
+  - name: KAESAStarCraft
+depends:
+  - name: ModuleManager
+  - name: B9PartSwitch
+  - name: Harmony2
+  - name: CryoTanks
+  - name: CommunityResourcePack
+  - name: BreakingGround-DLC
+recommends:
+  - name: Waterfall
+  - name: TexturesUnlimited
+  - name: ASETProps
+  - name: RasterPropMonitor
+suggests:
+  - name: FreeIva
+  - name: Benjee10-SharedAssets
+  - name: HullcamVDSContinued
+  - name: CommunityCategoryKit
+  - name: Firefly
+install:
+  - file: GameData/KAESA/StarCraft
+    install_to: GameData/KAESA
+  # the four ready-to-fly sample crafts (same zip: this is not a second source)
+  - file: Ships/VAB
+    install_to: Ships
