@@ -13,7 +13,7 @@ namespace KAESA.StarCraft
         bool KaesaActive { get; }
         // torque (vessel axes: x pitch, y roll, z yaw) of a full swing of the command (-1 -> +1), x surface area
         Vector3 UnitTorque(Vector3 com, Transform rt);
-        // ITorqueProvider-style report (also handed to MechJeb by the Harmony prefix)
+        // ITorqueProvider-style report (SAS reads it; MechJeb gets the flaps' one through KAESAFlapTorquePatch)
         void GetPotentialTorque(out Vector3 pos, out Vector3 neg);
     }
 
