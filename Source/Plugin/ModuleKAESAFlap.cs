@@ -1,228 +1,227 @@
-// KAESA StarCraft - ModuleKAESAFlap
-// Starship-style flap on top of the stock control surface:
-//  - one-sided travel: 0 deg = fully out (max drag) .. maxFold = folded toward the leeward side;
-//  - a rest angle the flap holds with no input; pitch / yaw / roll input moves it around that angle;
-//  - modes: Control (rest + input), Retracted (maxFold), Extended (0), with action groups;
-//  - aero follows the real flap: the lift base is the static "flapPivot" transform whose X axis is the hinge, so the
-//    stock lift rotation (AngleAxis(deflection, baseTransform.right)) and the visual rotation of ctrlSurface
-//    (AngleAxis(deflection, right) * neutral, in the pivot's frame) are the same rotation.
-// Input mixing is our own: the stock one takes Dot(input axis, hinge axis), and a Starship flap's hinge runs along the
-// hull, so pitch and yaw always came out as zero (the flaps never moved with WASD). Here each flap works out the force
-// CHANGE it makes when it opens from the rest angle (flat plate: normal force ~ cos(fold), along the plate normal; the
-// difference between "opened by the range" and "folded by the range": mostly more drag against the airflow plus a little
-// outward side force, because an opened flap loses the inward lift it had while folded), the torque of that change about
-// the CoM, and opens or folds by how well that torque matches the torque the pilot / SAS asks for (same axes and signs
-// as a reaction wheel). With four flaps that gives Starship's scheme by itself: pitch = front vs back, roll = left vs
-// right, yaw = the diagonals.
-// SAS / autopilots: the stock potential-torque report (ITorqueProvider) would be ~0 for these flaps for the same reason,
-// so SAS tuned itself to the reaction wheel only and over-corrected; this module re-implements ITorqueProvider with the
-// real torque (dynamic pressure x plate area x the force change above).
-// The stock module still does the lift / drag forces, authority limiter, ignore pitch / yaw / roll and actuator speed.
+// KAESA StarCraft - ModuleKAESAFlap (v3, written 2026-11-26)
+//
+// A Starship flap built on KSP's own stock control surface (ModuleControlSurface): the stock code still makes the lift and
+// drag forces, the actuator speed, the authority limiter, ignore pitch / yaw / roll and the deploy switch, exactly as players
+// know them. This module adds what a Starship flap needs on top:
+//  - one-sided travel: 0 deg = fully out (most drag) .. maxFold = folded against the leeward side;
+//  - a rest angle the flap holds with no input; steering moves it around that by up to ctrlSurfaceRange;
+//  - modes: Control (rest + steering), Retracted (folded), Extended (fully out), with action groups;
+//  - steering through the vessel-wide KAESA allocation (KAESAControl.cs), shared with the grid fins. The stock mixing reads
+//    how the input axis lines up with the hinge, and a Starship flap's hinge runs along the hull, so stock pitch / yaw come
+//    out as ~0. Here each flap reports the torque it makes when it opens from "folded by the range" to "opened by the
+//    range" (simple flat-plate estimate: normal force ~ cos(fold), air on the belly, area = deflectionLiftCoeff x 3.52 m2),
+//    and gets its share of pitch / roll / yaw: four flaps give pitch = front against back, roll = left against right,
+//    yaw = the diagonals;
+//  - a real torque report for SAS (ITorqueProvider), and through a small Harmony prefix for MechJeb, which asks the stock
+//    control surface directly.
+//
+// History:
+//  - v1 (2026-11-14) followed the idea of SEP's ModuleSEPControlSurface. The SEP team pointed out in 2026-11 that it was too
+//    close to their code.
+//  - On 2026-11-26 it was rewritten twice:
+//    - first as its own module with its own aerodynamics (kept in KAESA_backup/flap_propria_2026-11-26);
+//    - then, by the user's choice of the safer path, as this new file on the stock control surface again, so the flight feel
+//      stays the one already tested.
+//    - The steering estimate is v1's on purpose (the user asked for the old behaviour, rewritten, with its bugs fixed).
+//      Fixes are marked "fix:" below:
+//      - plate Cn missing from the estimate;
+//      - authority limiter outside the allocation;
+//      - stale surface list after a dock / undock.
+//  - SEP's code was not looked at. v1 was read for the model's axis conventions, the names that crafts save (restFold,
+//    flapMode, the actions) and its steering estimate.
+//  - SEP's DLL was compared afterwards by structure only: SEP's flap derives from ModuleLiftingSurface and has its own
+//    deploy / flip / landing angles; this one derives from ModuleControlSurface.
+//
+// Model axes ("flapPivot" transform): X = hinge, Z = plate normal at fold 0 (out to windward), Y = chord at fold 0. The flap
+// transform (ctrlSurface) is a child of the pivot. The pivot is handed to the stock code as baseTransform, so the stock lift
+// turns with the flap about the real hinge.
 using System;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
 
-[assembly: KSPAssembly("KAESA.StarCraft", 1, 1)]
-[assembly: KSPAssemblyDependency("HarmonyKSP", 1, 0)]
-
 namespace KAESA.StarCraft
 {
-    // MechJeb (and anything else that asks a ModuleControlSurface directly instead of through ITorqueProvider) calls the
-    // stock, sealed ModuleControlSurface.GetPotentialTorque, which is ~0 for these flaps. A Harmony prefix hands those
-    // callers the flap's real torque (ModuleKAESAFlap.GetPotentialTorque below); other control surfaces are untouched.
+    // MechJeb calls ModuleControlSurface.GetPotentialTorque directly (not through ITorqueProvider), and that stock method is
+    // ~0 for a hinge along the hull. This prefix answers for KAESA surfaces only; every other control surface is untouched.
     [KSPAddon(KSPAddon.Startup.Instantly, true)]
-    public class KAESAStarCraftPatcher : MonoBehaviour
+    public class KAESAFlapTorquePatch : MonoBehaviour
     {
         private void Awake()
         {
             try
             {
-                var harmony = new HarmonyLib.Harmony("kaesa.starcraft.flaps");
-                MethodInfo orig = typeof(ModuleControlSurface).GetMethod("GetPotentialTorque", BindingFlags.Public | BindingFlags.Instance, null,
-                    new Type[] { typeof(Vector3).MakeByRefType(), typeof(Vector3).MakeByRefType() }, null);
-                MethodInfo pre = typeof(KAESAStarCraftPatcher).GetMethod("TorquePrefix", BindingFlags.Public | BindingFlags.Static);
-                harmony.Patch(orig, new HarmonyLib.HarmonyMethod(pre));
-                Debug.Log("[KAESA] ModuleControlSurface.GetPotentialTorque patched for ModuleKAESAFlap (MechJeb / autopilots)");
+                MethodInfo target = typeof(ModuleControlSurface).GetMethod("GetPotentialTorque", BindingFlags.Public | BindingFlags.Instance, null,
+                    new[] { typeof(Vector3).MakeByRefType(), typeof(Vector3).MakeByRefType() }, null);
+                MethodInfo prefix = typeof(KAESAFlapTorquePatch).GetMethod("Prefix", BindingFlags.Public | BindingFlags.Static);
+                new HarmonyLib.Harmony("kaesa.starcraft.flaptorque").Patch(target, new HarmonyLib.HarmonyMethod(prefix));
             }
             catch (Exception e)
             {
-                Debug.LogError("[KAESA] Harmony patch for the flaps failed: " + e);
+                Debug.LogError("[KAESA] flap torque patch not applied (MechJeb will see the stock value): " + e.Message);
             }
         }
 
-        public static bool TorquePrefix(ModuleControlSurface __instance, ref Vector3 pos, ref Vector3 neg)
+        public static bool Prefix(ModuleControlSurface __instance, ref Vector3 pos, ref Vector3 neg)
         {
-            IKAESAControl f = __instance as IKAESAControl;       // flaps and grid fins
-            if (f == null) return true;
-            f.GetPotentialTorque(out pos, out neg);
+            IKAESAControl k = __instance as IKAESAControl;
+            if (k == null) return true;
+            k.GetPotentialTorque(out pos, out neg);
             return false;
         }
     }
 
     public class ModuleKAESAFlap : ModuleControlSurface, ITorqueProvider, IKAESAControl
     {
-        // static transform at the hinge: X = hinge axis, transformDir axis = plate normal at fold 0
-        [KSPField] public string pivotTransformName = "flapPivot";
-        // full travel (deg) and which sign of the stock deflection folds the flap toward the leeward side
-        [KSPField] public float maxFold = 78f;
-        [KSPField] public float foldSign = -1f;
-        // centre of pressure of the plate in ctrlSurface's frame (lever arm for the torque)
-        [KSPField] public Vector3 copOffset = new Vector3(0f, 0.93f, 0f);
-        // (kept for old configs; the whole-vessel allocation below replaced the per-flap gain)
-        [KSPField] public float controlGain = 5f;
-        // plate area per unit of deflectionLiftCoeff (stock: 1 lift unit ~ 3.52 m2) and flat-plate normal force coefficient
-        [KSPField] public float areaPerLiftCoeff = 3.52f;
-        [KSPField] public float plateCn = 1.2f;
+        private const string GRP = "kaesaFlap";
+        private const string GRP_NAME = "Starship flap";
+        private const float M2_PER_LIFT_UNIT = 3.52f;    // plate area per unit of deflectionLiftCoeff (the cfgs' convention)
 
-        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Rest angle", guiUnits = "°",
-            groupName = "kaesaFlap", groupDisplayName = "Starship flap")]
-        [UI_FloatRange(minValue = 0f, maxValue = 78f, stepIncrement = 1f, scene = UI_Scene.All)]
+        [KSPField] public string pivotTransformName = "flapPivot";
+        [KSPField] public float maxFold = 90f;           // deg, folded end of the travel
+        [KSPField] public float foldSign = -1f;          // which sign of the stock deflection folds the flap
+        [KSPField] public Vector3 copOffset = new Vector3(0f, 0.93f, 0f);   // plate centre in ctrlSurface's frame (lever arm)
+        [KSPField] public float plateCn = 1.2f;          // flat-plate normal-force coefficient, for the steering estimate only
+
+        // saved in crafts (names kept from v1)
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Rest angle", guiUnits = "°", groupName = GRP, groupDisplayName = GRP_NAME)]
+        [UI_FloatRange(minValue = 0f, maxValue = 90f, stepIncrement = 1f, scene = UI_Scene.All)]
         public float restFold = 39f;
 
-        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Flap mode", groupName = "kaesaFlap",
-            groupDisplayName = "Starship flap")]
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Flap mode", groupName = GRP, groupDisplayName = GRP_NAME)]
         [UI_ChooseOption(options = new string[] { "Control", "Retracted", "Extended" }, scene = UI_Scene.All)]
         public string flapMode = "Control";
 
-        [KSPField(guiActive = true, guiActiveEditor = false, guiName = "Flap angle", guiUnits = "°", guiFormat = "F0",
-            groupName = "kaesaFlap", groupDisplayName = "Starship flap")]
-        public float currentFold = -1f;
+        [KSPField(guiActive = true, guiName = "Flap angle", guiUnits = "°", guiFormat = "F0", groupName = GRP, groupDisplayName = GRP_NAME)]
+        public float currentFold = 0f;
 
-        // -1 (fold) .. +1 (open): what the pilot / SAS input asks of this flap
-        [KSPField(guiActive = true, guiActiveEditor = false, guiName = "Flap command", guiFormat = "F2",
-            groupName = "kaesaFlap", groupDisplayName = "Starship flap")]
+        [KSPField(guiActive = true, guiName = "Flap command", guiFormat = "F2", groupName = GRP, groupDisplayName = GRP_NAME)]
         public float flapCommand = 0f;
 
+        private Transform pivot;
+        private float fold = -1f;
+        private readonly List<IKAESAControl> controls = new List<IKAESAControl>();
+        private int controlsPartCount = -1;
+        private Vessel controlsVessel;
+
+        // ================================================================ setup
         public override void OnStart(StartState state)
         {
             base.OnStart(state);
-            Transform pivot = part.FindModelTransform(pivotTransformName);
-            if (pivot != null)
-                baseTransform = pivot;
-            else
-                Debug.LogWarning("[KAESA] ModuleKAESAFlap: transform '" + pivotTransformName + "' not found in " + part.partInfo.name);
-            SetRange(Fields["restFold"].uiControlEditor as UI_FloatRange);
-            SetRange(Fields["restFold"].uiControlFlight as UI_FloatRange);
+            pivot = part.FindModelTransform(pivotTransformName);
+            if (pivot != null) baseTransform = pivot;
+            else Debug.LogWarning("[KAESA] ModuleKAESAFlap: no '" + pivotTransformName + "' in " + part.partInfo.name);
+            UI_FloatRange r = Fields["restFold"].uiControlEditor as UI_FloatRange; if (r != null) r.maxValue = maxFold;
+            r = Fields["restFold"].uiControlFlight as UI_FloatRange; if (r != null) r.maxValue = maxFold;
             restFold = Mathf.Clamp(restFold, 0f, maxFold);
-            currentFold = TargetFold(0f);
-            Apply();
+            fold = Target(0f);
+            Show();
         }
 
-        private void SetRange(UI_FloatRange r)
-        {
-            if (r != null) r.maxValue = maxFold;
-        }
-
-        // act = how far (deg) to open the flap past the rest angle (negative folds it further)
-        private float TargetFold(float act)
+        // ================================================================ travel
+        // fold for a steering command: +1 opens by the whole range (less fold), -1 folds by it
+        private float Target(float cmd)
         {
             if (flapMode == "Retracted") return maxFold;
             if (flapMode == "Extended") return 0f;
-            return Mathf.Clamp(restFold - act, 0f, maxFold);
+            return Mathf.Clamp(restFold - cmd * Mathf.Abs(ctrlSurfaceRange) * authorityLimiter * 0.01f, 0f, maxFold);
+        }
+
+        // the stock code reads "deflection" for its lift; the flap model follows the same rotation about the hinge
+        private void Show()
+        {
+            deflection = foldSign * fold;
+            currentFold = fold;
+            if (ctrlSurface != null) ctrlSurface.localRotation = Quaternion.AngleAxis(deflection, Vector3.right) * neutral;
         }
 
         protected override void CtrlSurfaceUpdate(Vector3 vel)
         {
-            flapCommand = flapMode == "Control" ? ControlCommand(vel) : 0f;
-            action = flapCommand * ctrlSurfaceRange * authorityLimiter * 0.01f;
-            Step(TimeWarp.fixedDeltaTime);
+            flapCommand = KaesaActive && vessel != null
+                ? KAESAControlAllocator.Command(vessel, Controls(), this, ignorePitch, ignoreRoll, ignoreYaw) : 0f;
+            action = flapCommand * ctrlSurfaceRange * authorityLimiter * 0.01f;     // stock field, in degrees like the stock surface's
+            if (fold < 0f) fold = Target(0f);
+            fold = Mathf.MoveTowards(fold, Target(flapCommand), Mathf.Max(actuatorSpeed, 1f) * TimeWarp.fixedDeltaTime);
+            Show();
         }
 
         protected override void CtrlSurfaceEditorUpdate(Vector3 CoM)
         {
-            flapCommand = 0f;
-            action = 0f;
-            Step(Time.deltaTime);
+            flapCommand = 0f; action = 0f;
+            fold = Mathf.MoveTowards(fold < 0f ? Target(0f) : fold, Target(0f), Mathf.Max(actuatorSpeed, 1f) * Time.deltaTime);
+            Show();
         }
 
-        // normal force on the plate per unit (q * area * Cn) with the air coming from the windward side, at a given fold
-        private Vector3 PlateForce(float foldDeg, Vector3 n0, Vector3 o)
+        // ================================================================ allocation (shared with the grid fins)
+        public bool KaesaActive
         {
-            float f = foldDeg * Mathf.Deg2Rad, c = Mathf.Cos(f), sn = Mathf.Sin(f);
-            return -(n0 * c + o * sn) * c;
+            get { return flapMode == "Control" && pivot != null && ctrlSurface != null && part != null && !part.ShieldedFromAirstream; }
         }
 
-        // force change (per unit q * area * Cn) between the flap opened and folded by the control range around the rest
-        // angle; n0 = plate normal at fold 0 (windward), o = chord at fold 0 (outward); flipped if the air comes from leeward
-        private Vector3 OpenForceChange(Vector3 vel)
+        // the list of KAESA surfaces, built again when the vessel or its part count changes (fix: v1 only watched the count,
+        // so a dock / undock that kept the count kept a stale list)
+        private List<IKAESAControl> Controls()
         {
-            Vector3 n0 = baseTransform.forward, o = baseTransform.up;
-            float s = 1f;                                        // no airflow (on the pad): assume the belly flop
-            if (vel.sqrMagnitude > 1f)
+            if (vessel != controlsVessel || vessel.parts.Count != controlsPartCount || controls.Count == 0)
             {
-                float d = Vector3.Dot(vel.normalized, n0);
-                if (Mathf.Abs(d) > 0.05f) s = Mathf.Sign(d);
+                KAESAControlAllocator.Collect(vessel, controls);
+                controlsPartCount = vessel.parts.Count;
+                controlsVessel = vessel;
             }
-            float rest = Mathf.Clamp(restFold, 0f, maxFold), range = Mathf.Abs(ctrlSurfaceRange);
-            float fo = Mathf.Clamp(rest - range, 0f, maxFold), ff = Mathf.Clamp(rest + range, 0f, maxFold);
-            return s * (PlateForce(fo, n0, o) - PlateForce(ff, n0, o));
+            return controls;
         }
 
-        // ---------------------------------------------------------------- whole-vessel allocation
-        // Every KAESA control surface on the vessel (flaps, grid fins) works out the same allocation (KAESAControlAllocator):
-        // B = torque (vessel axes) per unit command of each surface; for each axis the minimum-norm set of commands that makes
-        // a PURE torque on that axis, scaled so the busiest surface uses its full travel. This decouples the axes even though
-        // a flap's opening makes a mix of pitch, roll and yaw (the forward flaps face a little outward, so opening both left
-        // flaps rolls AND yaws; the diagonals cancel that).
-        private readonly List<IKAESAControl> flaps = new List<IKAESAControl>();
-        private int flapsPartCount = -1;
-
-        private void RefreshFlaps()
+        // flat-plate normal force per unit (q x area x Cn) at a fold, air hitting the windward face: the plate normal at that
+        // fold is n0 cos f + o sin f (n0 = windward normal at fold 0, o = chord out from the hinge), and a plate's normal force
+        // goes roughly with the cosine of how far it is turned from facing the air
+        private static Vector3 PlatePush(float foldDeg, Vector3 n0, Vector3 o)
         {
-            if (vessel.parts.Count == flapsPartCount && flaps.Count > 0) return;
-            KAESAControlAllocator.Collect(vessel, flaps);
-            flapsPartCount = vessel.parts.Count;
+            float f = foldDeg * Mathf.Deg2Rad, c = Mathf.Cos(f);
+            return -(n0 * c + o * Mathf.Sin(f)) * c;
         }
 
-        private bool Active
-        {
-            get { return flapMode == "Control" && ctrlSurface != null && baseTransform != null && part != null && !part.ShieldedFromAirstream; }
-        }
-
-        public bool KaesaActive { get { return Active; } }
-
-        // torque per unit command (opening = +1, full swing), vessel axes (x pitch, y roll, z yaw), x plate area
+        // vessel-axis torque per Pa of dynamic pressure (N m / Pa, the same unit as the grid fins'): the force change from
+        // "folded by the range" to "opened by the range" around the rest angle, at the plate's centre. Same simple estimate
+        // as before; fixes: the plate Cn is now in (v1 left it out here, so flaps and grid fins were mixed 1.2x off), and the
+        // range follows the authority limiter like the real travel does.
+        // Air from the leeward side flips the sign; with no airflow (on the pad) it assumes the belly flop.
         public Vector3 UnitTorque(Vector3 com, Transform rt)
         {
-            if (!Active) return Vector3.zero;
-            Vector3 vel = part.Rigidbody != null ? part.Rigidbody.GetPointVelocity(ctrlSurface.position) + Krakensbane.GetFrameVelocityV3f() : Vector3.zero;
-            Vector3 r = ctrlSurface.TransformPoint(copOffset) - com;
-            return rt.InverseTransformDirection(Vector3.Cross(r, OpenForceChange(vel)) * (deflectionLiftCoeff * areaPerLiftCoeff));
+            if (!KaesaActive) return Vector3.zero;
+            Vector3 n0 = pivot.forward, o = pivot.up;
+            float s = 1f;
+            if (part.Rigidbody != null)
+            {
+                Vector3 vel = part.Rigidbody.GetPointVelocity(ctrlSurface.position) + Krakensbane.GetFrameVelocityV3f();
+                if (vel.sqrMagnitude > 1f)
+                {
+                    float d = Vector3.Dot(vel.normalized, n0);
+                    if (Mathf.Abs(d) > 0.05f) s = Mathf.Sign(d);
+                }
+            }
+            float range = Mathf.Abs(ctrlSurfaceRange) * authorityLimiter * 0.01f;
+            float fOpen = Mathf.Clamp(restFold - range, 0f, maxFold), fFold = Mathf.Clamp(restFold + range, 0f, maxFold);
+            Vector3 change = s * (PlatePush(fOpen, n0, o) - PlatePush(fFold, n0, o)) * (deflectionLiftCoeff * M2_PER_LIFT_UNIT * plateCn);
+            return rt.InverseTransformDirection(Vector3.Cross(ctrlSurface.TransformPoint(copOffset) - com, change));
         }
 
-        private float ControlCommand(Vector3 vel)
-        {
-            if (vessel == null) return 0f;
-            RefreshFlaps();
-            return KAESAControlAllocator.Command(vessel, flaps, this, ignorePitch, ignoreRoll, ignoreYaw);
-        }
-
-        // SAS / autopilots ask every ITorqueProvider how much torque it can make (vessel axes: x pitch, y roll, z yaw).
-        // Each surface reports an equal share of what the whole set makes for a pure command on each axis.
+        // SAS / autopilots: this flap's share of what all the KAESA surfaces can do on each axis (kN m, one way)
         public new void GetPotentialTorque(out Vector3 pos, out Vector3 neg)
         {
             pos = neg = Vector3.zero;
-            if (!HighLogic.LoadedSceneIsFlight || !Active || vessel == null) return;
-            RefreshFlaps();
-            KAESAControlAllocator.PotentialTorque(vessel, flaps, this, part.dynamicPressurekPa, plateCn, authorityLimiter,
-                ignorePitch, ignoreRoll, ignoreYaw, out pos, out neg);
+            if (!HighLogic.LoadedSceneIsFlight || vessel == null || !KaesaActive) return;
+            List<IKAESAControl> list = Controls();
+            float gp, gr, gy; Vector3 full;
+            if (!KAESAControlAllocator.Allocate(vessel, list, this, out gp, out gr, out gy, out full)) return;
+            int n = KAESAControlAllocator.ActiveCount(list);
+            if (n == 0) return;
+            // q in kPa x (N m / Pa) = kN m; half a full swing each way. The authority limiter is already in UnitTorque's range
+            // (fix: v1 applied it here only, while the allocation itself ignored it).
+            float k = (float)part.dynamicPressurekPa * 0.5f / n;
+            pos = neg = new Vector3(ignorePitch ? 0f : full.x * k, ignoreRoll ? 0f : full.y * k, ignoreYaw ? 0f : full.z * k);
         }
 
-        private void Step(float dt)
-        {
-            if (currentFold < 0f) currentFold = TargetFold(0f);
-            currentFold = Mathf.MoveTowards(currentFold, TargetFold(action), Mathf.Max(actuatorSpeed, 1f) * dt);
-            Apply();
-        }
-
-        private void Apply()
-        {
-            deflection = foldSign * currentFold;
-            if (ctrlSurface != null)
-                ctrlSurface.localRotation = Quaternion.AngleAxis(deflection, Vector3.right) * neutral;
-        }
-
+        // ================================================================ actions (names kept from v1) and info
         [KSPAction("Flaps: retract")]
         public void KaesaRetract(KSPActionParam p) { flapMode = "Retracted"; }
 
@@ -235,16 +234,13 @@ namespace KAESA.StarCraft
         [KSPAction("Flaps: toggle retract")]
         public void KaesaToggleRetract(KSPActionParam p) { flapMode = flapMode == "Retracted" ? "Control" : "Retracted"; }
 
-        public override string GetModuleDisplayName()
-        {
-            return "Starship Flap";
-        }
+        public override string GetModuleDisplayName() { return "Starship Flap"; }
 
         public override string GetInfo()
         {
-            return "Starship-style flap: 0° (out) to " + maxFold.ToString("F0") + "° (folded), rest angle " +
-                   restFold.ToString("F0") + "°, ±" + ctrlSurfaceRange.ToString("F0") + "° of control around it.\n\n" +
-                   base.GetInfo();
+            return "Starship flap: 0° (out) to " + maxFold.ToString("F0") + "° (folded), rest angle " + restFold.ToString("F0") +
+                   "°, ±" + Mathf.Abs(ctrlSurfaceRange).ToString("F0") + "° of steering around it, shared with the other flaps " +
+                   "and the grid fins.\n\n" + base.GetInfo();
         }
     }
 }
